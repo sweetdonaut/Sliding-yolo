@@ -43,6 +43,7 @@ if not hasattr(np, "trapz"):
 
 from ultralytics import YOLO
 
+import s3_io
 from dsnr import compute_dsnr
 from infer_sliding import (
     PixelMapHook,
@@ -82,15 +83,17 @@ def read_raw(
         gray = decode_real_raw(path)            # HxW uint8 or uint16
         gray8 = (gray >> 8).astype(np.uint8)    # if 16-bit, scale to 8-bit
         return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+
+    Accepts both local paths and ``s3://bucket/key`` URIs (see s3_io.py).
     """
-    data = np.fromfile(str(path), dtype=dtype)
-    expected = int(np.prod(shape))
-    if data.size != expected:
+    raw_bytes = s3_io.open_bytes(path)
+    expected = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    if len(raw_bytes) != expected:
         raise ValueError(
-            f"{path}: byte count {data.size} != expected {expected} "
+            f"{path}: byte count {len(raw_bytes)} != expected {expected} "
             f"for shape={shape} dtype={dtype}"
         )
-    return data.reshape(shape)
+    return np.frombuffer(raw_bytes, dtype=dtype).reshape(shape)
 
 
 # --------------------------------------------------------------------------- #
@@ -99,29 +102,28 @@ def read_raw(
 
 
 def load_roi(path: str | Path, default_xlen: int = 10) -> list[dict]:
-    """Parse a ROI CSV.
+    """Parse a ROI CSV. Accepts local paths and ``s3://`` URIs.
 
     Accepts either:
         - 5-column header: layer, xlen, ylen, rawx, rawy   (canonical)
         - 4-column header: layer, ylen, rawx, rawy         (xlen defaulted)
     """
     rois: list[dict] = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        has_xlen = reader.fieldnames is not None and "xlen" in reader.fieldnames
-        for row in reader:
-            try:
-                rois.append(
-                    {
-                        "layer": row["layer"],
-                        "xlen": int(row["xlen"]) if has_xlen else default_xlen,
-                        "ylen": int(row["ylen"]),
-                        "rawx": int(row["rawx"]),
-                        "rawy": int(row["rawy"]),
-                    }
-                )
-            except (KeyError, ValueError) as e:
-                raise ValueError(f"bad ROI row in {path}: {row}") from e
+    reader = s3_io.open_text_csv(path)
+    has_xlen = reader.fieldnames is not None and "xlen" in reader.fieldnames
+    for row in reader:
+        try:
+            rois.append(
+                {
+                    "layer": row["layer"],
+                    "xlen": int(row["xlen"]) if has_xlen else default_xlen,
+                    "ylen": int(row["ylen"]),
+                    "rawx": int(row["rawx"]),
+                    "rawy": int(row["rawy"]),
+                }
+            )
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"bad ROI row in {path}: {row}") from e
     return rois
 
 
@@ -159,21 +161,20 @@ def load_val_defects(
     Expected columns: DID, rawname, rawx, rawy
 
     Returns a dict {rawname -> [(DID, rawx, rawy), ...]} so matching is
-    scoped to the correct raw file.
+    scoped to the correct raw file. Accepts local paths and ``s3://`` URIs.
     """
     by_name: dict[str, list[tuple[str, int, int]]] = {}
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        required = {"DID", "rawname", "rawx", "rawy"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(
-                f"{path}: validation CSV missing columns {missing}"
-            )
-        for row in reader:
-            by_name.setdefault(row["rawname"], []).append(
-                (row["DID"], int(row["rawx"]), int(row["rawy"]))
-            )
+    reader = s3_io.open_text_csv(path)
+    required = {"DID", "rawname", "rawx", "rawy"}
+    missing = required - set(reader.fieldnames or [])
+    if missing:
+        raise ValueError(
+            f"{path}: validation CSV missing columns {missing}"
+        )
+    for row in reader:
+        by_name.setdefault(row["rawname"], []).append(
+            (row["DID"], int(row["rawx"]), int(row["rawy"]))
+        )
     return by_name
 
 
@@ -352,8 +353,8 @@ def _make_patch_figures(
 
 
 def process_one_image(
-    raw_path: Path,
-    roi_path: Path,
+    raw_path: str,
+    roi_path: str,
     yolo: YOLO,
     hook: PixelMapHook,
     device: torch.device,
@@ -363,6 +364,8 @@ def process_one_image(
     verbose: bool = True,
 ) -> list[dict]:
     """Run the full per-image pipeline; returns a list of kept rows.
+
+    `raw_path` and `roi_path` may be local paths or ``s3://`` URIs.
 
     If `keep_layers` is given, only ROI rows whose `layer` is in the set
     are used as keep regions. All other ROI rows are dropped before the
@@ -378,7 +381,7 @@ def process_one_image(
     else:
         rois = rois_all
 
-    stem = raw_path.stem
+    stem = s3_io.stem(raw_path)
     kept: list[dict] = []
     for x, y, score, src_x0, src_y0 in points:
         inside, layer = point_in_any_roi(x, y, rois)
@@ -455,6 +458,24 @@ def parse_args() -> argparse.Namespace:
                    help="patch side length in pixels for --viz-patches")
     p.add_argument("--quiet", action="store_true",
                    help="suppress per-tile infer prints")
+    # ----- S3 connection (only used when --images / --roi / --model is s3://) -----
+    # Any flag left unset falls back to boto3's default credential chain
+    # (env vars, ~/.aws/credentials, IAM role, etc). For private/internal
+    # S3-compatible services (MinIO, Cloudflare R2, on-prem object stores)
+    # set --s3-endpoint-url to your service URL.
+    p.add_argument("--s3-endpoint-url", default=None,
+                   help="S3 endpoint URL for non-AWS S3-compatible storage "
+                        "(e.g. https://minio.company.internal:9000). Falls back "
+                        "to AWS_ENDPOINT_URL_S3 / AWS_ENDPOINT_URL env vars.")
+    p.add_argument("--s3-access-key-id", default=None,
+                   help="S3 access key ID. Falls back to AWS_ACCESS_KEY_ID env "
+                        "var or ~/.aws/credentials if omitted. WARNING: passing "
+                        "secrets on the command line exposes them via `ps`; "
+                        "prefer env vars in production.")
+    p.add_argument("--s3-secret-access-key", default=None,
+                   help="S3 secret access key. Falls back to AWS_SECRET_ACCESS_KEY.")
+    p.add_argument("--s3-region", default=None,
+                   help="S3 region name. Falls back to AWS_DEFAULT_REGION.")
     return p.parse_args()
 
 
@@ -464,18 +485,29 @@ def main() -> None:
     if len(raw_shape) != 3:
         raise ValueError(f"--raw-shape must be H,W,C; got {args.raw_shape}")
 
-    images_dir = Path(args.images)
-    roi_dir = Path(args.roi)
+    # Wire CLI flags into the S3 client config. Anything left as None here
+    # transparently falls back to boto3's default credential chain.
+    s3_io.configure(
+        endpoint_url=args.s3_endpoint_url,
+        access_key_id=args.s3_access_key_id,
+        secret_access_key=args.s3_secret_access_key,
+        region=args.s3_region,
+    )
+
+    # Output paths are always local. Inputs (--images, --roi, --val-csv,
+    # --model) may be s3:// URIs (see s3_io.py).
     out_path = Path(args.out)
 
-    raws = sorted(images_dir.glob("*.raw"))
+    raws = s3_io.list_files(args.images, ".raw")
     if not raws:
-        raise FileNotFoundError(f"no .raw files in {images_dir}")
+        raise FileNotFoundError(f"no .raw files in {args.images}")
 
-    # Load model + hook ONCE, reuse across all images.
+    # Load model + hook ONCE, reuse across all images. ultralytics needs a
+    # real local file, so we materialize the model first if it's on s3.
     dev_str = args.device if torch.cuda.is_available() else "cpu"
     device = torch.device(dev_str)
-    yolo = YOLO(args.model)
+    model_local = s3_io.ensure_local(args.model)
+    yolo = YOLO(model_local)
     yolo.model.to(device).eval()
     hook = PixelMapHook(yolo)
 
@@ -508,8 +540,8 @@ def main() -> None:
 
     print(f"[prod] {len(raws)} raw files, model={args.model}, device={device}")
 
-    # rawname -> raw file path, used later to reload images for dSNR.
-    raw_paths_by_stem: dict[str, Path] = {}
+    # rawname -> raw file path/URI, used later to reload images for dSNR.
+    raw_paths_by_stem: dict[str, str] = {}
 
     # NOTE: keep `hook` alive until after the optional --viz-patches loop
     # below — `_rerun_source_window` re-runs the model and reads the latest
@@ -519,9 +551,9 @@ def main() -> None:
     # be a crop of that one stale tensor. Hook is closed at the end of main.
     all_rows: list[dict] = []
     for raw_path in raws:
-        stem = raw_path.stem
-        roi_path = roi_dir / f"{stem}.csv"
-        if not roi_path.exists():
+        stem = s3_io.stem(raw_path)
+        roi_path = s3_io.join_path(args.roi, f"{stem}.csv")
+        if not s3_io.exists(roi_path):
             print(f"  [WARN] no ROI csv for {stem}, skipping")
             continue
         raw_paths_by_stem[stem] = raw_path

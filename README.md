@@ -57,7 +57,77 @@ python prod_infer.py \
 | `output_top100_viz_raw.png` | (with `--viz-patches`) 10×10 grid of raw image crops centered on each top point. |
 | `output_top100_viz_overlay.png` | (with `--viz-patches`) Same grid showing the P2 pmap re-rendered from the **exact source sliding window** that produced each point. |
 
-### 5. Useful flags
+### 5. Reading from S3
+
+`--images`, `--roi`, `--val-csv`, and `--model` accept either local paths
+or `s3://bucket/key` URIs. See `s3_io.py` for details. Resolution order
+for an S3 URI:
+
+1. **Mock mode** — if env var `S3_MOCK_ROOT` is set, the URI
+   `s3://bucket/key` is rewritten to `${S3_MOCK_ROOT}/bucket/key` and
+   read from disk. No `boto3` needed. Useful for offline testing.
+2. **Real S3** — `boto3` is imported lazily and the object is fetched
+   from the live bucket. `boto3` is an *optional* dependency.
+
+Outputs (`--out`, `--top-dsnr-out`, `--viz-patches` images) are always
+written locally.
+
+**Mock mode example** (exercises the S3 code path against the local synthetic dataset):
+
+```bash
+S3_MOCK_ROOT=/path/to/Sliding-yolo \
+python prod_infer.py \
+  --images s3://data/synth/prod/images \
+  --roi   s3://data/synth/prod/roi \
+  --model s3://runs/segment/p2seg_run1/weights/best.pt \
+  --val-csv s3://data/synth/prod/val_defects.csv \
+  --out output.csv \
+  --viz-patches --quiet
+```
+
+**Real AWS S3 example** (`pip install boto3`, default credential chain via `aws configure` / env vars / IAM role):
+
+```bash
+python prod_infer.py \
+  --images s3://my-prod-bucket/raws/2026-04-08 \
+  --roi   s3://my-prod-bucket/rois/2026-04-08 \
+  --model s3://my-prod-bucket/models/p2seg_run1.pt \
+  --out output.csv
+```
+
+**Private / on-prem S3-compatible service** (MinIO, Cloudflare R2, internal object store) — pass connection params explicitly:
+
+```bash
+python prod_infer.py \
+  --images s3://prod-bucket/raws \
+  --roi   s3://prod-bucket/rois \
+  --model s3://prod-bucket/models/best.pt \
+  --out   output.csv \
+  --s3-endpoint-url      https://minio.company.internal:9000 \
+  --s3-access-key-id     "$S3_ACCESS_KEY_ID" \
+  --s3-secret-access-key "$S3_SECRET_ACCESS_KEY" \
+  --s3-region            us-east-1
+```
+
+Each S3 flag falls back to its boto3 default if omitted, so you can mix
+and match — e.g., set the endpoint URL on the command line but keep the
+secret in `AWS_SECRET_ACCESS_KEY` to avoid leaking it via `ps`:
+
+```bash
+export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
+export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
+python prod_infer.py \
+  --images s3://prod-bucket/raws \
+  --roi   s3://prod-bucket/rois \
+  --model s3://prod-bucket/models/best.pt \
+  --s3-endpoint-url https://minio.company.internal:9000 \
+  --out   output.csv
+```
+
+The model file is downloaded once to a hashed path under
+`/tmp/slidingyolo-s3-cache/` and reused on subsequent runs.
+
+### 6. Useful flags
 
 | Flag | Default | Use |
 |------|---------|-----|
@@ -71,7 +141,7 @@ python prod_infer.py \
 | `--viz-patch-size` | `75` | patch side length in px for `--viz-patches` |
 | `--quiet` | off | suppress per-tile progress prints |
 
-### 6. Verify the run
+### 7. Verify the run
 
 After the run, check stderr for two key lines:
 
@@ -113,4 +183,5 @@ patches indicate either a real model degradation or a code regression in
 | `train.py` | From-scratch training (no pretrained weights) |
 | `infer_sliding.py` | Sliding-window inference core (`sliding_infer_array` is the reusable API) |
 | `prod_infer.py` | Production batch driver: ROI filter + top-N dSNR + optional viz |
+| `s3_io.py` | Path I/O abstraction for local + `s3://` URIs (mock or real boto3) |
 | `dsnr.py` | dSNR rescoring (placeholder — replace for real production) |
