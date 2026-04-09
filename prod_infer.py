@@ -63,26 +63,30 @@ def read_raw(
     shape: tuple[int, int, int] = (7168, 7168, 3),
     dtype: np.dtype | type = np.uint8,
 ) -> np.ndarray:
-    """Load a .raw file into an HxWx3 BGR uint8 numpy array.
+    """Load a .raw file into a numpy array the inference pipeline can consume.
 
     PLACEHOLDER IMPLEMENTATION — REPLACE FOR REAL PRODUCTION FORMAT.
 
     The current default assumes the raw file is a plain uncompressed byte
     stream matching `shape` and `dtype`, which is what gen_prod_data.py
-    produces. Real production raws may instead be:
-        * grayscale (1 channel) at uint8 or uint16
-        * little/big endian specific
-        * prepended with a header (frame counter, timestamp, etc.)
-        * encoded with a vendor-specific lossless codec
+    writes. Real production raws may instead be grayscale uint16, header-
+    prepended, vendor-encoded, etc. — replace the body with your decoder.
 
-    When you wire up the real decoder, keep the output contract identical:
-    return a contiguous HxWx3 uint8 BGR array so the rest of the pipeline
-    (which was trained on BGR 8-bit images) works without further changes.
-    If your sensor is grayscale, stack it into 3 channels here:
+    Output contract — return ANY of these and the pipeline handles the rest:
+        * HxWx3 uint8 BGR (default)              — values in [0, 255]
+        * HxWx3 float BGR                        — values in [0, 1]
+        * HxW   uint8 grayscale                  — values in [0, 255]
+        * HxW   float grayscale                  — values in [0, 1]
 
-        gray = decode_real_raw(path)            # HxW uint8 or uint16
-        gray8 = (gray >> 8).astype(np.uint8)    # if 16-bit, scale to 8-bit
-        return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
+    The pipeline auto-broadcasts grayscale to 3 channels and only divides
+    by 255 if the input is uint8. Float inputs are passed through to the
+    GPU as-is, so they MUST already be in [0, 1] (the same range the model
+    was trained on after the standard uint8/255 normalization). If your
+    sensor gives a different range (e.g. 12-bit [0, 4095]), normalize it
+    here before returning, e.g.::
+
+        raw_u16 = decode_real_raw(path)             # HxW uint16, [0, 4095]
+        return raw_u16.astype(np.float32) / 4095.0  # HxW float, [0, 1]
 
     Accepts both local paths and ``s3://bucket/key`` URIs (see s3_io.py).
     """
@@ -308,8 +312,11 @@ def _make_patch_figures(
                 continue
             p = patches[i]
             if mode == "raw":
+                # uint8 ranges 0-255; float decoders return [0, 1].
+                raw = p["raw"]
+                raw_vmax = 255 if raw.dtype == np.uint8 else 1.0
                 ax.imshow(
-                    p["raw"], cmap="gray", vmin=0, vmax=255,
+                    raw, cmap="gray", vmin=0, vmax=raw_vmax,
                     interpolation="nearest",
                 )
             else:  # pmap
@@ -644,7 +651,11 @@ def main() -> None:
             )
 
         if args.viz_patches:
-            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            # img may already be 2D grayscale (HxW) — only convert if 3-channel.
+            if img.ndim == 2:
+                img_gray = img
+            else:
+                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             for r in group:
                 cx, cy = r["rawx"], r["rawy"]
                 # Use the EXACT sliding window that originally produced

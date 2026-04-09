@@ -153,9 +153,33 @@ def merge_points(
 # --------------------------------------------------------------------------- #
 
 
-def _preprocess(img_bgr: np.ndarray, device: torch.device) -> torch.Tensor:
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    t = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+def _preprocess(img: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert a tile to a normalized (1, 3, H, W) float tensor on `device`.
+
+    Accepts whatever shape/dtype `read_raw` returned for the tile:
+    - HxWx3 uint8 BGR — current default; gets BGR→RGB, /255
+    - HxWx3 float BGR (already in [0, 1]) — no scaling
+    - HxW uint8 grayscale — broadcast to 3 channels, /255
+    - HxW float grayscale (already in [0, 1]) — broadcast to 3 channels, no scaling
+
+    Float arrays are assumed to be in [0, 1] already (the same range the
+    model was trained on after uint8/255 normalization). If your decoder
+    produces a different range, scale it in `read_raw` before returning.
+    """
+    if img.ndim == 3 and img.shape[2] == 3:
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        t = torch.from_numpy(rgb).permute(2, 0, 1)
+    elif img.ndim == 2:
+        # Single-channel gray → broadcast to 3 channels (R = G = B).
+        t = torch.from_numpy(np.ascontiguousarray(img)).unsqueeze(0).repeat(3, 1, 1)
+    else:
+        raise ValueError(
+            f"_preprocess: expected HxW or HxWx3 array, got shape {img.shape}"
+        )
+
+    t = t.float()
+    if img.dtype == np.uint8:
+        t = t / 255.0
     return t.unsqueeze(0).to(device)
 
 
@@ -184,7 +208,8 @@ def sliding_infer_array(
     ----------
     yolo : ultralytics.YOLO — already moved to `device` and `.eval()`
     hook : PixelMapHook — already registered on `yolo`
-    img_bgr : HxWx3 uint8 BGR numpy array (what cv2.imread returns)
+    img_bgr : HxWx3 (BGR) or HxW (grayscale) numpy array. Either uint8
+        in [0, 255] or float in [0, 1]. See `_preprocess` for the contract.
     device : torch.device
 
     Returns
@@ -196,11 +221,14 @@ def sliding_infer_array(
         reproduce the exact inference context for each point.
     (W, H) : image size
     """
-    if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
+    if img_bgr.ndim == 3 and img_bgr.shape[2] == 3:
+        H, W = img_bgr.shape[:2]
+    elif img_bgr.ndim == 2:
+        H, W = img_bgr.shape
+    else:
         raise ValueError(
-            f"expected HxWx3 BGR array, got shape {img_bgr.shape}"
+            f"expected HxW or HxWx3 array, got shape {img_bgr.shape}"
         )
-    H, W = img_bgr.shape[:2]
 
     all_points: list[tuple[float, float, float, int, int]] = []
     windows = list(sliding_windows(H, W, window, stride))
